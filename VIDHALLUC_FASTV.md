@@ -2,6 +2,8 @@
 
 This setup adds a VidHalluc evaluator and a repo-local FastV path for `DAMO-NLP-SG/VideoLLaMA2-7B-16F`.
 
+For the full RunPod walkthrough on a single RTX 3090, see [RUNPOD_3090_VIDHALLUC_FASTV_STEP_BY_STEP.md](./RUNPOD_3090_VIDHALLUC_FASTV_STEP_BY_STEP.md).
+
 ## Install
 
 ```bash
