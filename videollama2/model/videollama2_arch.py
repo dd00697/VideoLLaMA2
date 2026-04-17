@@ -111,6 +111,16 @@ class Videollama2MetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
+    def _set_fastv_visual_token_span(self, start_index, token_length):
+        model = self.get_model()
+        if hasattr(model, "set_fastv_visual_token_span"):
+            model.set_fastv_visual_token_span(start_index, token_length)
+        else:
+            model.fastv_visual_token_start_index = start_index
+            model.fastv_visual_token_length = token_length
+        self.config.fastv_visual_token_start_index = start_index
+        self.config.fastv_visual_token_length = token_length
+
     def encode_images_or_videos(self, images):
         num_frames = self.config.num_frames if hasattr(self.config, 'num_frames') else NUM_FRAMES
 
@@ -162,6 +172,7 @@ class Videollama2MetaForCausalLM(ABC):
         self, input_ids, attention_mask, past_key_values, labels, images
     ):
         vision_tower = self.get_vision_tower()
+        self._set_fastv_visual_token_span(None, None)
         # NOTE: text-only situation
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             # if past_key_values is not None and vision_tower is not None and Xs is not None and input_ids.shape[1] == 1:
@@ -172,9 +183,11 @@ class Videollama2MetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
+        mm_spans = []
         cur_mm_idx = 0
         # replace image/video/audio tokens with pre-computed embeddings
         for batch_idx, cur_input_ids in enumerate(input_ids):
+            cur_mm_spans = []
             num_multimodals = sum((cur_input_ids == mm_token_idx).sum() for mm_token_idx in MODAL_INDEX_MAP.values())
             # pure text input
             if num_multimodals == 0:
@@ -186,6 +199,7 @@ class Videollama2MetaForCausalLM(ABC):
                 new_input_embeds.append(cur_input_embeds)
                 if labels is not None:
                     new_labels.append(labels[batch_idx])
+                mm_spans.append(cur_mm_spans)
                 cur_mm_idx += 1 
                 continue
 
@@ -201,7 +215,9 @@ class Videollama2MetaForCausalLM(ABC):
                 mm_token_start = mm_token_indices[0]
 
                 cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:mm_token_start])) 
+                span_start = sum(x.shape[0] for x in cur_new_input_embeds)
                 cur_new_input_embeds.append(cur_mm_features)
+                cur_mm_spans.append((span_start, cur_mm_features.shape[0]))
                 if labels is not None:
                     cur_new_labels.append(cur_labels[:mm_token_start])
                     cur_new_labels.append(torch.full((cur_mm_features.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
@@ -219,6 +235,7 @@ class Videollama2MetaForCausalLM(ABC):
             # NOTE: one cur_new_input_embeds per each  
             cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
             new_input_embeds.append(cur_new_input_embeds)
+            mm_spans.append(cur_mm_spans)
             if labels is not None:
                 cur_new_labels = torch.cat(cur_new_labels, dim=0)
                 new_labels.append(cur_new_labels)
@@ -259,5 +276,10 @@ class Videollama2MetaForCausalLM(ABC):
                 new_attn_mask_pad_left = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - input_ids.shape[1]), True, dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
+
+        if len(mm_spans) == 1 and mm_spans[0]:
+            self._set_fastv_visual_token_span(mm_spans[0][0][0], mm_spans[0][0][1])
+        else:
+            self._set_fastv_visual_token_span(None, None)
 
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
