@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from torch.utils.data import Dataset
 
@@ -100,6 +100,131 @@ def resolve_video_path(data_root: str, subset: str, video_id: str) -> str:
     return os.path.join(candidate_video_roots(data_root, subset)[0], f"{video_id}.mp4")
 
 
+def _normalize_bad_video_name(name: str) -> str:
+    basename = os.path.basename(str(name).strip())
+    if not basename:
+        return ""
+    if not basename.lower().endswith(".mp4"):
+        basename = f"{basename}.mp4"
+    return basename
+
+
+def load_bad_video_basenames(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    bad_names: List[str] = []
+    if isinstance(payload, list):
+        entries: Iterable[Any] = payload
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("bad_basenames"), list):
+            entries = payload["bad_basenames"]
+        elif isinstance(payload.get("bad_videos"), list):
+            entries = payload["bad_videos"]
+        else:
+            entries = []
+            for value in payload.values():
+                if isinstance(value, list):
+                    entries = list(entries) + value
+    else:
+        entries = []
+
+    for entry in entries:
+        if isinstance(entry, str):
+            normalized = _normalize_bad_video_name(entry)
+        elif isinstance(entry, dict):
+            normalized = _normalize_bad_video_name(
+                entry.get("basename") or entry.get("video_id") or entry.get("video_path") or ""
+            )
+        else:
+            normalized = ""
+        if normalized:
+            bad_names.append(normalized)
+    return sorted(set(bad_names))
+
+
+def enumerate_unique_videos(data_root: str, subsets: Sequence[str]) -> List[Dict[str, str]]:
+    seen = set()
+    records: List[Dict[str, str]] = []
+    for subset in subsets:
+        path = os.path.join(data_root, _SUBSET_FILENAME[subset])
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if subset == "ach_binaryqa":
+            for q_list in data.values():
+                if not isinstance(q_list, list):
+                    continue
+                for q_entry in q_list:
+                    answers = q_entry.get("a", {}) or {}
+                    for video_id in answers.keys():
+                        basename = _normalize_bad_video_name(video_id)
+                        key = (subset, basename)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        records.append(
+                            {
+                                "subset": subset,
+                                "video_id": video_id,
+                                "basename": basename,
+                                "video_path": resolve_video_path(data_root, subset, video_id),
+                            }
+                        )
+        elif subset == "ach_mcq":
+            for vids in data.values():
+                if not isinstance(vids, dict):
+                    continue
+                for video_id in vids.keys():
+                    basename = _normalize_bad_video_name(video_id)
+                    key = (subset, basename)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    records.append(
+                        {
+                            "subset": subset,
+                            "video_id": video_id,
+                            "basename": basename,
+                            "video_path": resolve_video_path(data_root, subset, video_id),
+                        }
+                    )
+        elif subset == "sth":
+            for video_id in data.keys():
+                basename = _normalize_bad_video_name(video_id)
+                key = (subset, basename)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(
+                    {
+                        "subset": subset,
+                        "video_id": video_id,
+                        "basename": basename,
+                        "video_path": resolve_video_path(data_root, subset, video_id),
+                    }
+                )
+        elif subset == "tsh":
+            for entry in data.values():
+                video_id = entry.get("video", "")
+                basename = _normalize_bad_video_name(video_id)
+                key = (subset, basename)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(
+                    {
+                        "subset": subset,
+                        "video_id": video_id,
+                        "basename": basename,
+                        "video_path": resolve_video_path(data_root, subset, video_id),
+                    }
+                )
+    return records
+
+
 class VidHallucDataset(Dataset):
     def __init__(
         self,
@@ -109,6 +234,7 @@ class VidHallucDataset(Dataset):
         max_samples: Optional[int] = None,
         num_chunks: int = 1,
         chunk_idx: int = 0,
+        extra_bad_video_basenames: Optional[Sequence[str]] = None,
     ):
         self.data_root = os.path.abspath(data_root)
         self.subsets = list(subsets)
@@ -116,6 +242,10 @@ class VidHallucDataset(Dataset):
         self.data_list: List[Dict[str, Any]] = []
         self.missing_videos: Dict[str, int] = {}
         self.excluded_videos: Dict[str, int] = {}
+        self.bad_video_basenames = set(KNOWN_BAD_ACH_FILENAMES)
+        if extra_bad_video_basenames:
+            self.bad_video_basenames.update(_normalize_bad_video_name(name) for name in extra_bad_video_basenames)
+        self.bad_video_basenames.discard("")
 
         for subset in self.subsets:
             if subset not in SUBSETS:
@@ -147,7 +277,7 @@ class VidHallucDataset(Dataset):
     ):
         video_path = resolve_video_path(self.data_root, subset, video_id)
         basename = os.path.basename(video_path)
-        if subset in ("ach_binaryqa", "ach_mcq") and basename in KNOWN_BAD_ACH_FILENAMES:
+        if basename in self.bad_video_basenames:
             self.excluded_videos[subset] = self.excluded_videos.get(subset, 0) + 1
             return
         if not os.path.exists(video_path):

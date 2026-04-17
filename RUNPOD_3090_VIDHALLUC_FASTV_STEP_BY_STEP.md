@@ -709,6 +709,86 @@ tail -100 /workspace/vidhalluc_fastv_3000.log
 
 Or rerun the smoke test directly in the foreground so you can see the traceback.
 
+### `CLIPVisionModel does not support Flash Attention 2.0 yet`
+
+This means the vision tower is still forcing `flash_attention_2`.
+
+Patch it:
+
+```bash
+cd /workspace/VideoLLaMA2
+python3 - <<'PY'
+from pathlib import Path
+path = Path("videollama2/model/encoder.py")
+text = path.read_text()
+text = text.replace('config._attn_implementation = "flash_attention_2"', 'config._attn_implementation = "eager"')
+text = text.replace("config._attn_implementation = 'flash_attention_2'", 'config._attn_implementation = "eager"')
+path.write_text(text)
+print("patched", path)
+PY
+```
+
+Then rerun the smoke test.
+
+### `IndexKernel.cu:92 ... index out of bounds` during FastV runs
+
+This means the FastV path is hitting a Mistral position/cache mismatch after pruning. The symptom is usually:
+
+- baseline works
+- FastV runs produce `0.0000` accuracy
+- pruned predictions are mostly failed/skipped rows rather than real answers
+
+Patch it like this:
+
+```bash
+cd /workspace/VideoLLaMA2
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("videollama2/model/videollama2_mistral.py")
+text = p.read_text()
+old = """                    hidden_states = hidden_states[:, keep_indices, :]
+                    position_ids = keep_indices.unsqueeze(0).to(position_ids.device)
+                    if base_attention_mask is not None and base_attention_mask.dim() == 2:
+                        base_attention_mask = base_attention_mask[:, keep_indices]
+"""
+new = """                    hidden_states = hidden_states[:, keep_indices, :]
+                    position_ids = torch.arange(
+                        hidden_states.shape[1], device=hidden_states.device, dtype=torch.long
+                    ).unsqueeze(0)
+                    if base_attention_mask is not None and base_attention_mask.dim() == 2:
+                        base_attention_mask = None
+"""
+if old not in text:
+    raise SystemExit("first patch anchor not found")
+p.write_text(text.replace(old, new))
+
+p = Path("videollama2/eval/vidhalluc/inference_vidhalluc.py")
+text = p.read_text()
+old = "            use_cache=True,\\n"
+new = '            use_cache=not bool(getattr(model.config, "use_fastv", False)),\\n'
+if old not in text:
+    raise SystemExit("second patch anchor not found")
+p.write_text(text.replace(old, new, 1))
+
+print("patched FastV stability fix")
+PY
+```
+
+After patching, rerun with a clean smoke-test directory, for example:
+
+```bash
+rm -rf /workspace/outputs/vidhalluc/VideoLLaMA2-7B-16F/ach_binaryqa_10
+cd /workspace/VideoLLaMA2
+MODEL_PATH=/workspace/models/VideoLLaMA2-7B-16F \
+VIDHALLUC_DATA_ROOT=/workspace/VidHalluc \
+OUTPUT_ROOT=/workspace/outputs/vidhalluc \
+MAX_SAMPLES=10 \
+RESUME=0 \
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/eval/eval_vidhalluc_fastv_all.sh
+```
+
 ### Dataset looks wrong
 
 Re-run the extraction script and verify the final counts again.

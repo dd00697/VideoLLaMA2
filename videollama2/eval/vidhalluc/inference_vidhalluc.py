@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -14,7 +16,15 @@ from videollama2.constants import DEFAULT_VIDEO_TOKEN
 from videollama2.mm_utils import KeywordsStoppingCriteria, tokenizer_multimodal_token
 from videollama2.utils import disable_torch_init
 
-from . import SUBSETS, VidHallucDataset, build_prompt, is_correct, parse_answer, resolve_default_data_root
+from . import (
+    SUBSETS,
+    VidHallucDataset,
+    build_prompt,
+    is_correct,
+    load_bad_video_basenames,
+    parse_answer,
+    resolve_default_data_root,
+)
 
 
 FIXED_DECODING = {
@@ -26,6 +36,29 @@ FIXED_DECODING = {
     "length_penalty": 1.0,
     "max_new_tokens": 32,
 }
+
+
+class SampleTimeoutError(TimeoutError):
+    pass
+
+
+@contextlib.contextmanager
+def sample_time_limit(seconds: int):
+    if seconds <= 0 or not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+
+    def _handle_timeout(signum, frame):
+        raise SampleTimeoutError(f"sample timed out after {seconds} seconds")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--num-chunks", type=int, default=1)
     parser.add_argument("--chunk-idx", type=int, default=0)
+    parser.add_argument("--sample-timeout-seconds", type=int, default=0)
+    parser.add_argument("--bad-videos-json", default=None)
     parser.add_argument("--use-fastv", action="store_true")
     parser.add_argument("--fastv-k", type=int, default=3)
     parser.add_argument("--fastv-r", type=float, default=0.5)
@@ -135,12 +170,51 @@ def generate_response(video_tensor, instruct: str, model, tokenizer) -> str:
     attention_mask = input_ids.ne(tokenizer.pad_token_id).long().cuda()
     stopping_criteria = [KeywordsStoppingCriteria([tokenizer.eos_token], tokenizer, input_ids)]
 
+    if bool(getattr(model.config, "use_fastv", False)):
+        current_ids = input_ids
+        current_attention_mask = attention_mask
+        generated_ids: List[torch.Tensor] = []
+        eos_token_id = tokenizer.eos_token_id
+        max_new_tokens = int(FIXED_DECODING["max_new_tokens"])
+
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                outputs = model(
+                    input_ids=current_ids,
+                    attention_mask=current_attention_mask,
+                    images=tensor,
+                    use_cache=False,
+                    output_attentions=False,
+                    return_dict=True,
+                )
+                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+                generated_ids.append(next_token)
+                current_ids = torch.cat((current_ids, next_token), dim=1)
+                current_attention_mask = torch.cat(
+                    (
+                        current_attention_mask,
+                        torch.ones(
+                            (current_attention_mask.shape[0], 1),
+                            dtype=current_attention_mask.dtype,
+                            device=current_attention_mask.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                if eos_token_id is not None and int(next_token.item()) == int(eos_token_id):
+                    break
+
+        if generated_ids:
+            generated = torch.cat(generated_ids, dim=1)
+            return tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
+        return ""
+
     with torch.inference_mode():
         output_ids = model.generate(
             input_ids,
             attention_mask=attention_mask,
             images=tensor,
-            use_cache=True,
+            use_cache=not bool(getattr(model.config, "use_fastv", False)),
             stopping_criteria=stopping_criteria,
             pad_token_id=tokenizer.eos_token_id,
             **FIXED_DECODING,
@@ -162,6 +236,8 @@ def main():
     configure_fastv(model, args.use_fastv, args.fastv_k, args.fastv_r)
     model.eval()
 
+    extra_bad_video_basenames = load_bad_video_basenames(args.bad_videos_json)
+
     pred_path = os.path.join(args.save_path, "predictions.jsonl")
     done_ids: set = set()
     existing_records: List[Dict[str, Any]] = []
@@ -177,6 +253,7 @@ def main():
         max_samples=args.max_samples,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
+        extra_bad_video_basenames=extra_bad_video_basenames,
     )
 
     records = list(existing_records)
@@ -187,22 +264,23 @@ def main():
                 continue
 
             try:
-                example = dataset[idx]
-                raw_output = generate_response(example["video"], build_prompt(example), model, tokenizer)
-                pred = parse_answer(raw_output, example["subset"])
-                correct = is_correct(pred, example["gold"], example["subset"])
-                record = {
-                    "subset": example["subset"],
-                    "sample_id": example["sample_id"],
-                    "video_id": example["video_id"],
-                    "video_path": example["video_path"],
-                    "question": example["question"],
-                    "options": example["options"],
-                    "gold": example["gold"],
-                    "raw_output": raw_output,
-                    "pred": pred,
-                    "correct": bool(correct),
-                }
+                with sample_time_limit(args.sample_timeout_seconds):
+                    example = dataset[idx]
+                    raw_output = generate_response(example["video"], build_prompt(example), model, tokenizer)
+                    pred = parse_answer(raw_output, example["subset"])
+                    correct = is_correct(pred, example["gold"], example["subset"])
+                    record = {
+                        "subset": example["subset"],
+                        "sample_id": example["sample_id"],
+                        "video_id": example["video_id"],
+                        "video_path": example["video_path"],
+                        "question": example["question"],
+                        "options": example["options"],
+                        "gold": example["gold"],
+                        "raw_output": raw_output,
+                        "pred": pred,
+                        "correct": bool(correct),
+                    }
             except Exception as exc:
                 record = {
                     "subset": meta["subset"],
@@ -236,8 +314,11 @@ def main():
         "fastv_k": args.fastv_k,
         "fastv_r": args.fastv_r,
         "data_root": args.data_root,
+        "bad_videos_json": args.bad_videos_json,
+        "bad_video_basenames": extra_bad_video_basenames,
         "missing_videos": dataset.missing_videos,
         "excluded_videos": dataset.excluded_videos,
+        "sample_timeout_seconds": args.sample_timeout_seconds,
         "num_chunks": args.num_chunks,
         "chunk_idx": args.chunk_idx,
     }

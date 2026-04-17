@@ -21,7 +21,9 @@ class CLIPVisionTower(nn.Module):
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
 
         config = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
-        config._attn_implementation = "flash_attention_2"
+        # CLIPVisionModel does not support flash_attention_2 in transformers 4.40.
+        # Force a safe path so the 7B-16F checkpoint loads on standard RunPod setups.
+        config._attn_implementation = "eager"
 
         if not load_pretrained:
             self.vision_tower = CLIPVisionModel(config=config)
@@ -93,7 +95,8 @@ class SiglipVisionTower(nn.Module):
         self.image_processor = SiglipImageProcessor.from_pretrained(self.vision_tower_name)
 
         config = SiglipVisionConfig.from_pretrained(self.vision_tower_name)
-        config._attn_implementation = 'flash_attention_2'
+        # Match the CLIP path above and avoid forcing FA2 on the vision tower.
+        config._attn_implementation = "eager"
 
         if not load_pretrained:
             self.vision_tower = SiglipVisionModel(config=config)

@@ -28,11 +28,24 @@ pip install flash-attn==2.5.8 --no-build-isolation
 
 ## Single Run
 
+Preflight scan for corrupted/stalling videos:
+
+```bash
+VIDHALLUC_DATA_ROOT=/workspace/VidHalluc \
+SUBSET=ach_binaryqa \
+OUTPUT_JSON=/workspace/VidHalluc/bad_videos_ach_binaryqa.json \
+VALIDATE_TIMEOUT_SECONDS=20 \
+bash scripts/eval/scan_vidhalluc_videos.sh
+```
+
+Then pass the generated denylist into the evaluator:
+
 Baseline:
 
 ```bash
 MODEL_PATH=DAMO-NLP-SG/VideoLLaMA2-7B-16F \
 VIDHALLUC_DATA_ROOT=/workspace/VidHalluc \
+BAD_VIDEOS_JSON=/workspace/VidHalluc/bad_videos_ach_binaryqa.json \
 RUN_NAME=baseline \
 USE_FASTV=0 \
 bash scripts/eval/eval_vidhalluc_fastv.sh
@@ -43,6 +56,7 @@ Default FastV:
 ```bash
 MODEL_PATH=DAMO-NLP-SG/VideoLLaMA2-7B-16F \
 VIDHALLUC_DATA_ROOT=/workspace/VidHalluc \
+BAD_VIDEOS_JSON=/workspace/VidHalluc/bad_videos_ach_binaryqa.json \
 RUN_NAME=fastv_default \
 USE_FASTV=1 \
 FASTV_K=3 \
@@ -61,6 +75,7 @@ Runs:
 ```bash
 MODEL_PATH=DAMO-NLP-SG/VideoLLaMA2-7B-16F \
 VIDHALLUC_DATA_ROOT=/workspace/VidHalluc \
+BAD_VIDEOS_JSON=/workspace/VidHalluc/bad_videos_ach_binaryqa.json \
 bash scripts/eval/eval_vidhalluc_fastv_all.sh
 ```
 
@@ -88,3 +103,16 @@ The all-in-one script also writes:
   - one worker per visible GPU
   - shard outputs under `_shards/`
   - automatic merge back into the final run directory
+- If a sample appears to stall on video decode, set `SAMPLE_TIMEOUT_SECONDS` to skip it after a wall-clock limit:
+
+```bash
+MODEL_PATH=DAMO-NLP-SG/VideoLLaMA2-7B-16F \
+VIDHALLUC_DATA_ROOT=/workspace/VidHalluc \
+SAMPLE_TIMEOUT_SECONDS=120 \
+bash scripts/eval/eval_vidhalluc_fastv.sh
+```
+
+- Timed-out samples are written to `predictions.jsonl` with:
+  - `"skipped": true`
+  - `"error": "sample timed out after ... seconds"`
+- For decoder hangs that do not respect the Python timeout, run the preflight scan first and use `BAD_VIDEOS_JSON=...` so those files are skipped before inference starts.

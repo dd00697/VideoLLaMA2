@@ -12,6 +12,8 @@ USE_FASTV="${USE_FASTV:-0}"
 FASTV_K="${FASTV_K:-3}"
 FASTV_R="${FASTV_R:-0.5}"
 RESUME="${RESUME:-1}"
+SAMPLE_TIMEOUT_SECONDS="${SAMPLE_TIMEOUT_SECONDS:-0}"
+BAD_VIDEOS_JSON="${BAD_VIDEOS_JSON:-}"
 
 CKPT_NAME="$(basename "${MODEL_PATH}")"
 EXP_ROOT="${OUTPUT_ROOT}/${CKPT_NAME}/${SUBSET}_${MAX_SAMPLES}"
@@ -41,7 +43,12 @@ COMMON_ARGS=(
   --subset "${SUBSET}"
   --max-samples "${MAX_SAMPLES}"
   --num-frames "${NUM_FRAMES}"
+  --sample-timeout-seconds "${SAMPLE_TIMEOUT_SECONDS}"
 )
+
+if [[ -n "${BAD_VIDEOS_JSON}" ]]; then
+  COMMON_ARGS+=(--bad-videos-json "${BAD_VIDEOS_JSON}")
+fi
 
 if [[ "${RESUME}" == "1" ]]; then
   COMMON_ARGS+=(--resume)

@@ -181,7 +181,14 @@ class Videollama2MistralModel(Videollama2MetaModel, MistralModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
-        if position_ids is None:
+        fastv_requested = (
+            bool(getattr(self.config, "use_fastv", False))
+            and batch_size == 1
+            and seq_length > 1
+            and past_key_values_length == 0
+        )
+
+        if position_ids is None or fastv_requested:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
@@ -231,9 +238,11 @@ class Videollama2MistralModel(Videollama2MetaModel, MistralModel):
                 keep_indices = self._fastv_keep_indices(last_fastv_attention, hidden_states.shape[1])
                 if keep_indices is not None and keep_indices.numel() < hidden_states.shape[1]:
                     hidden_states = hidden_states[:, keep_indices, :]
-                    position_ids = keep_indices.unsqueeze(0).to(position_ids.device)
+                    position_ids = torch.arange(
+                        hidden_states.shape[1], device=hidden_states.device, dtype=torch.long
+                    ).unsqueeze(0)
                     if base_attention_mask is not None and base_attention_mask.dim() == 2:
-                        base_attention_mask = base_attention_mask[:, keep_indices]
+                        base_attention_mask = None
                     prepared_attention_mask = self._prepare_decoder_attention_mask(
                         base_attention_mask,
                         batch_size,
